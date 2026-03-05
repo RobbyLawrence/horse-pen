@@ -89,6 +89,31 @@ std::pair<bool, int> Solver::evaluate(const std::vector<char>& isWall) const {
     return {escaped, score};
 }
 
+std::pair<int, int> Solver::evaluateFull(const std::vector<char>& isWall) const {
+    ++cur_gen_;
+    static thread_local std::vector<int> q_buf;
+    q_buf.clear();
+
+    visited_gen_[horseIdx_] = cur_gen_;
+    q_buf.push_back(horseIdx_);
+    int borderCount = 0;
+    int score = 0;
+
+    for (size_t head = 0; head < q_buf.size(); head++) {
+        int cur = q_buf[head];
+        score += tileScore_[cur];
+        if (border_[cur]) borderCount++;
+
+        for (int nb : adj_[cur]) {
+            if (visited_gen_[nb] != cur_gen_ && !isWall[nb]) {
+                visited_gen_[nb] = cur_gen_;
+                q_buf.push_back(nb);
+            }
+        }
+    }
+    return {borderCount, score};
+}
+
 std::pair<std::vector<char>, int> Solver::greedyExpand(std::mt19937& rng, double randomness) {
     std::vector<bool> inS(n_, false);
     std::vector<bool> inBoundary(n_, false);
@@ -160,6 +185,36 @@ std::pair<std::vector<char>, int> Solver::greedyExpand(std::mt19937& rng, double
     struct Candidate { int tile; double value; };
     std::vector<Candidate> candidates;
 
+    // Helper to estimate reachable score through a portal
+    auto estimatePortalValue = [&](int portalIdx) -> int {
+        if (portalPair_[portalIdx] < 0) return 0;
+        int pairIdx = portalPair_[portalIdx];
+        if (inS[pairIdx] || inBoundary[pairIdx]) return 0; // already included
+        
+        // BFS from portal pair to estimate reachable high-value region
+        ++cur_gen_;
+        static thread_local std::vector<int> portal_q;
+        portal_q.clear();
+        portal_q.push_back(pairIdx);
+        visited_gen_[pairIdx] = cur_gen_;
+        
+        int reachableScore = 0;
+        int reachableTiles = 0;
+        for (size_t head = 0; head < portal_q.size() && reachableTiles < 50; head++) {
+            int cur = portal_q[head];
+            reachableScore += tileScore_[cur];
+            reachableTiles++;
+            
+            for (int nb : adj_[cur]) {
+                if (visited_gen_[nb] != cur_gen_ && !inS[nb] && !inBoundary[nb]) {
+                    visited_gen_[nb] = cur_gen_;
+                    portal_q.push_back(nb);
+                }
+            }
+        }
+        return reachableScore;
+    };
+
     while (true) {
         candidates.clear();
 
@@ -177,8 +232,16 @@ std::pair<std::vector<char>, int> Solver::greedyExpand(std::mt19937& rng, double
             if (newBoundarySize > budget_) continue;
 
             double value;
-            if (costChange <= 0) value = 1e6 + tileScore_[tile];
-            else value = (double)tileScore_[tile] / (1.0 + costChange);
+            int effectiveScore = tileScore_[tile];
+            
+            // Boost value if this is a portal with high-value accessible region
+            if (portalPair_[tile] >= 0) {
+                int portalBonus = estimatePortalValue(tile);
+                effectiveScore += portalBonus / 5; // discount future value
+            }
+            
+            if (costChange <= 0) value = 1e6 + effectiveScore;
+            else value = (double)effectiveScore / (1.0 + costChange);
             candidates.push_back({tile, value});
         }
 
@@ -213,6 +276,75 @@ std::pair<std::vector<char>, int> Solver::greedyExpand(std::mt19937& rng, double
     }
 
     return {bestLocalWalls, bestLocalScore};
+}
+
+std::pair<std::vector<char>, int> Solver::reverseGreedy(std::mt19937& rng, double randomness) {
+    std::vector<char> isWall(n_, 0);
+    int wallCount = 0;
+
+    while (wallCount < budget_) {
+        auto [baseBorder, baseScore] = evaluateFull(isWall);
+        if (baseBorder == 0) {
+            return {isWall, baseScore};
+        }
+
+        // Find all reachable wallable tiles
+        ++cur_gen_;
+        visited_gen_[horseIdx_] = cur_gen_;
+        std::vector<int> reachable = {horseIdx_};
+        for (size_t head = 0; head < reachable.size(); head++) {
+            int cur = reachable[head];
+            for (int nb : adj_[cur]) {
+                if (visited_gen_[nb] != cur_gen_ && !isWall[nb]) {
+                    visited_gen_[nb] = cur_gen_;
+                    reachable.push_back(nb);
+                }
+            }
+        }
+
+        // Try each reachable wallable tile: pick the one that reduces border
+        // count the most while preserving the most score
+        struct Candidate { int tile; int borderAfter; int scoreAfter; };
+        std::vector<Candidate> candidates;
+
+        for (int t : reachable) {
+            if (!wallable_[t] || t == horseIdx_) continue;
+            isWall[t] = 1;
+            auto [borderAfter, scoreAfter] = evaluateFull(isWall);
+            isWall[t] = 0;
+
+            if (borderAfter < baseBorder) {
+                candidates.push_back({t, borderAfter, scoreAfter});
+            }
+        }
+
+        if (candidates.empty()) {
+            return {{}, -1};
+        }
+
+        // Sort: highest score first (preserve largest area), break ties by
+        // fewer remaining borders (most progress toward enclosure)
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      if (a.scoreAfter != b.scoreAfter) return a.scoreAfter > b.scoreAfter;
+                      return a.borderAfter < b.borderAfter;
+                  });
+
+        int pick = 0;
+        if (randomness > 0 && candidates.size() > 1) {
+            int topK = std::max(2, (int)(candidates.size() * randomness));
+            topK = std::min(topK, (int)candidates.size());
+            std::uniform_int_distribution<int> dist(0, topK - 1);
+            pick = dist(rng);
+        }
+
+        isWall[candidates[pick].tile] = 1;
+        wallCount++;
+    }
+
+    auto [borderCount, score] = evaluateFull(isWall);
+    if (borderCount == 0) return {isWall, score};
+    return {{}, -1};
 }
 
 bool Solver::repairWalls(std::vector<char>& isWall, std::mt19937& rng) {
@@ -255,23 +387,24 @@ bool Solver::repairWalls(std::vector<char>& isWall, std::mt19937& rng) {
             path.push_back(t);
         }
 
-        // find the wallable tile closest to the horse on the exit path
-        // that should be the best block
-        int bestBlock = -1;
-        for (int i = (int)path.size() - 1; i >= 0; i--) {
-            if (wallable_[path[i]] && !isWall[path[i]]) { bestBlock = path[i]; break; }
+        // collect all wallable tiles on the escape path
+        std::vector<int> pathCandidates;
+        for (int t : path) {
+            if (wallable_[t] && !isWall[t]) pathCandidates.push_back(t);
         }
-        if (bestBlock < 0) {
+        if (pathCandidates.empty()) {
             for (int t : path) {
                 for (int nb : adj_[t]) {
                     if (wallable_[nb] && !isWall[nb] && nb != horseIdx_) {
-                        bestBlock = nb;
-                        break;
+                        pathCandidates.push_back(nb);
                     }
                 }
-                if (bestBlock >= 0) break;
+                if (!pathCandidates.empty()) break;
             }
         }
+        // pick randomly from candidates for diverse enclosures
+        int bestBlock = pathCandidates.empty() ? -1 :
+            pathCandidates[rng() % pathCandidates.size()];
         if (bestBlock < 0) return false;
 
         isWall[bestBlock] = 1;
@@ -482,8 +615,8 @@ SolveResult Solver::solve() {
     // the greedy approach and simulated annealing doesn't go on for too long
     std::vector<std::pair<std::vector<char>, int>> startingPoints;
 
-    // we let phase 1 have 3 seconds
-    auto phase1_end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    // we let phase 1 have 2 seconds
+    auto phase1_end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int trial = 0;
     while (std::chrono::steady_clock::now() < phase1_end) {
         double randomness;
@@ -503,6 +636,23 @@ SolveResult Solver::solve() {
               << " (" << startingPoints.size() << " starting points, "
               << trial << " trials)" << std::endl;
 
+    // Phase 1b: random repair from scratch (diverse enclosures)
+    auto phase1b_end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    int repairTrial = 0;
+    while (std::chrono::steady_clock::now() < phase1b_end) {
+        std::vector<char> isWall(n_, 0);
+        if (repairWalls(isWall, rng)) {
+            auto [esc, score] = evaluate(isWall);
+            if (!esc && score > 0) {
+                updateBest(isWall, score);
+                startingPoints.push_back({isWall, score});
+            }
+        }
+        repairTrial++;
+    }
+    std::cout << "Best after random repair: " << bestScore_
+              << " (" << repairTrial << " trials)" << std::endl;
+
     // local search and simulated annealing from the best 30 start
     std::sort(startingPoints.begin(), startingPoints.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -518,9 +668,10 @@ SolveResult Solver::solve() {
         if (unique_starts.size() >= 30) break;
     }
 
+    auto phase2_end = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     int searched = 0;
     for (auto& [walls, score] : unique_starts) {
-        if (timeUp()) break;
+        if (timeUp() || std::chrono::steady_clock::now() >= phase2_end) break;
         localSearch(walls, score);
         searched++;
     }
@@ -541,7 +692,7 @@ SolveResult Solver::solve() {
         }
         if (wallPos.empty()) break;
 
-        int k = 1 + rng() % std::max(1, std::min((int)wallPos.size(), budget_ / 2));
+        int k = 1 + rng() % std::max(1, (int)wallPos.size());
         std::shuffle(wallPos.begin(), wallPos.end(), rng);
 
         for (int i = 0; i < k; i++) walls[wallPos[i]] = 0;

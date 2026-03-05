@@ -22,10 +22,15 @@ private:
     Pos fromIdx(int i) const { return {i / cols_, i % cols_}; }
     // bfs eval with generation count, return {escaped, score}
     std::pair<bool, int> evaluate(const std::vector<char>& isWall) const;
+    // bfs eval returning {borderCount, score}
+    std::pair<int, int> evaluateFull(const std::vector<char>& isWall) const;
 
     // greedy region growing with randonness
     // first run should be deterministic, or nearly so
     std::pair<std::vector<char>, int> greedyExpand(std::mt19937& rng, double randomness);
+
+    // reverse greedy: block escape paths to find large enclosures
+    std::pair<std::vector<char>, int> reverseGreedy(std::mt19937& rng, double randomness);
 
     // 1-swap or 2-swap
     void localSearch(std::vector<char>& isWall, int& currentScore);
